@@ -9,7 +9,9 @@
     2. After the first classification, reuses ClickPatrol_Legitimate /
        ClickPatrol_Suspicious (and audience flags) on later pages without
        calling the measurement script again.
-    3. Loads the ClickPatrol measurement script (trck-002) only when needed:
+    3. Reloads trck-002 when a click id appears that differs from the last
+       stored one (source, gclid, …). The same source or gclid replays.
+    4. Loads the ClickPatrol measurement script (trck-002) only when needed:
        https://trck-002.clckptrl.com/?uid=...&<page query>&u=<href>&session_id=...
 -->
 <script>
@@ -130,11 +132,34 @@
     if (!id) { return ""; }
     return id.length <= 8 ? id : id.substring(id.length - 8);
   }
-  function hasNewClickId() {
+  function clickFingerprint() {
+    var out = "";
     for (var i = 0; i < CLICK_KEYS.length; i++) {
-      if (getQueryParam(CLICK_KEYS[i])) { return true; }
+      var value = getQueryParam(CLICK_KEYS[i]);
+      if (value) {
+        if (out) { out += "&"; }
+        out += CLICK_KEYS[i] + "=" + value;
+      }
     }
-    return false;
+    return out;
+  }
+  function hashFingerprint(fp) {
+    var h = 7;
+    for (var i = 0; i < fp.length; i++) {
+      var ch = fp.charAt(i);
+      var v = B36.indexOf(ch.toLowerCase());
+      if (v < 0) {
+        if (ch === "=") { v = 37; }
+        else if (ch === "&") { v = 38; }
+        else if (ch === "-") { v = 39; }
+        else if (ch === "_") { v = 40; }
+        else if (ch === ".") { v = 41; }
+        else { v = 42; }
+      }
+      h = h * 33 + v + i;
+      if (h > 2000000000) { h = h - Math.floor(h / 1000000000) * 1000000000; }
+    }
+    return toBase36(h);
   }
   function isSafeAudienceJson(text) {
     if (!text || text.length < 3 || text.charAt(0) !== "{" || text.charAt(text.length - 1) !== "}") {
@@ -148,12 +173,15 @@
     return true;
   }
   function encodeClass(kind, trafficCode, sessId, ts) {
-    return SCHEMA + "." + kind + "." + trafficCode + "." + sessionSuffix(sessId) + "." + toBase36(ts);
+    var value = SCHEMA + "." + kind + "." + trafficCode + "." + sessionSuffix(sessId) + "." + toBase36(ts);
+    var fp = clickFingerprint();
+    if (fp) { value += "." + hashFingerprint(fp); }
+    return value;
   }
   function parseClass(raw, sessId) {
     if (!raw) { return null; }
     var parts = raw.split(".");
-    if (parts.length !== 5 || parts[0] !== SCHEMA) { return null; }
+    if ((parts.length !== 5 && parts.length !== 6) || parts[0] !== SCHEMA) { return null; }
     if ((parts[1] !== "L" && parts[1] !== "S") || (parts[2] !== "s" && parts[2] !== "f")) { return null; }
     if (parts[3] !== sessionSuffix(sessId)) { return null; }
     var ts = fromBase36(parts[4]);
@@ -162,7 +190,8 @@
       raw: raw,
       event: parts[1] === "L" ? "ClickPatrol_Legitimate" : "ClickPatrol_Suspicious",
       traffic: parts[2] === "s" ? "safe" : "fake",
-      ts: ts
+      ts: ts,
+      clickHash: parts.length === 6 ? parts[5] : ""
     };
   }
   function encodeAudience(audience, sessId, ts) {
@@ -203,6 +232,13 @@
     }
     if (getCookie(key) || lsGet(key)) { lsRemove(key); }
     return null;
+  }
+  function hasNewClickId(sessId) {
+    var fp = clickFingerprint();
+    if (!fp) { return false; }
+    var parsed = readStore(CLASS_KEY, parseClass, sessId);
+    if (!parsed || !parsed.clickHash) { return true; }
+    return parsed.clickHash !== hashFingerprint(fp);
   }
   function writeClassValue(value) {
     if (!value || value.length > CLASS_MAX_BYTES) { return; }
@@ -268,7 +304,7 @@
     setCookie(SESSION_KEY, sessionId, SESSION_TTL_SECONDS);
     lsSet(SESSION_KEY, sessionId);
     hookDataLayer(sessionId);
-    if (!hasNewClickId() && replayFromCache(sessionId)) {
+    if (!hasNewClickId(sessionId) && replayFromCache(sessionId)) {
       return;
     }
     var scriptUrl = TRACKER_BASE + "?uid=" + encodeURIComponent(UID);
