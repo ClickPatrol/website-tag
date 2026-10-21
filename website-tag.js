@@ -580,7 +580,29 @@
     scriptUrl += "&u=" + encodeURIComponent(location.href);
     scriptUrl += "&visitor_id=" + encodeURIComponent(visitorId);
     scriptUrl += "&session_id=" + encodeURIComponent(sessionId);
-    injectScript(scriptUrl, "clickpatrol-cfp-script");
+    injectTrackerWhenLoaded(scriptUrl);
+  }
+  var trackerPending = "";
+  var trackerLoadWait = false;
+  // Same rule as cp-core.js. A script inserted before window.load holds the
+  // load event, even with async. Cache hits never reach this function.
+  function injectTrackerWhenLoaded(src) {
+    trackerPending = src;
+    function place() {
+      if (!trackerPending) { return; }
+      var next = trackerPending;
+      trackerPending = "";
+      injectScript(next, "clickpatrol-cfp-script");
+    }
+    var state = document.readyState;
+    if (state === "loading" || state === "interactive") {
+      if (!trackerLoadWait) {
+        trackerLoadWait = true;
+        window.addEventListener("load", function () { setTimeout(place, 0); });
+      }
+      return;
+    }
+    place();
   }
   injectTracker();
   window.addEventListener("pageshow", function (event) {

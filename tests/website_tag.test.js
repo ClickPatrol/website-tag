@@ -21,8 +21,10 @@ function run(world, opts) {
   const url = new URL(opts.href || 'https://www.example.com/page');
   const injected = [];
   const listeners = {};
+  const timeouts = [];
 
   const document = {
+    readyState: opts.readyState || '',
     get cookie() {
       return Object.keys(world.cookies).map((k) => k + '=' + world.cookies[k]).join('; ');
     },
@@ -57,6 +59,7 @@ function run(world, opts) {
     removeItem: (k) => { delete world.ls[k]; },
   };
   win.addEventListener = (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); };
+  win.setTimeout = (fn) => { timeouts.push(fn); return 1; };
   const history = { pushState: () => {} };
   win.history = history;
 
@@ -85,10 +88,11 @@ function run(world, opts) {
     String,
     encodeURIComponent,
     decodeURIComponent,
+    setTimeout: (fn) => { timeouts.push(fn); return 1; },
   };
   vm.createContext(ctx);
   vm.runInContext(code, ctx);
-  return { injected, win };
+  return { injected, win, listeners, timeouts };
 }
 
 const results = [];
@@ -275,6 +279,15 @@ const conv = (urls) => urls.filter((u) => u.indexOf('https://conversion.clckptrl
   check('Google Ads extension rewrites _gcl_ag for 90 days', /max-age=7776000/.test((w.cookieAttrs || {})._gcl_ag || ''), (w.cookieAttrs || {})._gcl_ag);
   check('extension keeps the raw cookie bytes', w.cookies._gcl_ag === '2.1.k0AAAAA-gbraid$i1730000000', w.cookies._gcl_ag);
   check('other groups stay off', !(w.cookieAttrs || {})._ga, '');
+}
+
+{
+  const w = makeWorld();
+  const held = run(w, { readyState: 'loading', href: 'https://www.example.com/page' });
+  check('trck-002 waits while the document is still loading', trck(held.injected).length === 0, held.injected.join(' '));
+  (held.listeners.load || []).forEach((fn) => fn());
+  held.timeouts.splice(0).forEach((fn) => fn());
+  check('trck-002 loads after window.load', trck(held.injected).length === 1, held.injected.join(' '));
 }
 
 let failed = 0;
