@@ -359,6 +359,42 @@ const conv = (urls) => urls.filter((u) => u.indexOf('https://conversion.clckptrl
   check('session mode caps cp_visitor_id cookie TTL to 24h and skips localStorage',
     /max-age=86400/.test((wSess.cookieAttrs || {}).cp_visitor_id || '') && Object.keys(wSess.ls).length === 0,
     JSON.stringify({ attrs: wSess.cookieAttrs, ls: wSess.ls }));
+
+  const wSessAds = makeWorld();
+  wSessAds.cookies._gcl_ag = '2.1.k0AAAAA-gbraid$i1730000000';
+  run(wSessAds, { storageMode: 'session', extend: ['googleAds'], gclidRecovery: true, href: 'https://www.example.com/?vd=vdclid' });
+  check('session mode keeps the 90 day lifetime on extended ad cookies',
+    /max-age=7776000/.test((wSessAds.cookieAttrs || {})._gcl_ag || ''),
+    (wSessAds.cookieAttrs || {})._gcl_ag);
+  check('session mode keeps the 90 day lifetime on recovered _gcl_aw',
+    /max-age=7776000/.test((wSessAds.cookieAttrs || {})._gcl_aw || '') && /^GCL\.\d+\.vdclid$/.test(decodeURIComponent(wSessAds.cookies._gcl_aw || '')),
+    JSON.stringify({ attrs: wSessAds.cookieAttrs, cookie: wSessAds.cookies._gcl_aw }));
+
+  const wMemClick = makeWorld();
+  wMemClick.cookies.cp_visitor_id = 'cp_stale_visitor';
+  wMemClick.cookies._gcl_aw = 'GCL.123.cookieclid';
+  const memClick = run(wMemClick, { storageMode: 'memory', href: 'https://www.example.com/thanks' });
+  memClick.win.dataLayer.push({ event: 'ClickPatrol_Conversion', conversion_id: 'order_mem', conversion_type: 'purchase' });
+  const memUrl = conv(memClick.injected)[0] || '';
+  const memTracker = memClick.injected.filter((u) => u.indexOf('trck-002') !== -1).join(' ');
+  check('memory mode still reads gclid from _gcl_aw', memUrl.includes('&gclid=cookieclid'), memUrl);
+  check('memory mode ignores a stale cp_visitor_id cookie and writes nothing',
+    wMemClick.cookies.cp_visitor_id === 'cp_stale_visitor' && !memTracker.includes('cp_stale_visitor') && Object.keys(wMemClick.ls).length === 0,
+    JSON.stringify({ cookies: wMemClick.cookies, tracker: memTracker }));
+
+  const wQueued = makeWorld();
+  wQueued.cookies.cp_session_id = 'cp_existing_session';
+  const seeded = run(wQueued, { href: 'https://www.example.com/?gclid=abc' });
+  seeded.win.dataLayer.push({ event: 'ClickPatrol_Suspicious', traffic: 'fake', audience: { legitieme_audience: false } });
+  wQueued.win = { adobeDataLayer: [] };
+  const queued = run(wQueued, {
+    href: 'https://www.example.com/pricing',
+    preDataLayer: [{ event: 'ClickPatrol_Suspicious', traffic: 'fake' }],
+  });
+  const queuedEvents = queued.win.dataLayer.filter((i) => i.event === 'ClickPatrol_Suspicious');
+  check('a classification already in the dataLayer is replayed once',
+    queuedEvents.length === 2 && queued.win.adobeDataLayer.length === 1,
+    JSON.stringify({ events: queuedEvents.length, adobe: queued.win.adobeDataLayer.length }));
 }
 
 let failed = 0;

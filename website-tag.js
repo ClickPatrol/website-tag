@@ -51,10 +51,12 @@
   // Storage mode for first-party ClickPatrol identifiers and cache:
   //   "full"    - default: cp_visitor_id (400d), cp_session_id (24h), cp_class (24h),
   //               cp_audience (24h) in first-party cookies + localStorage backup.
-  //   "session" - session-scoped cookies only (max 24h, no 400d persistent visitor
-  //               cookie, no localStorage writes).
-  //   "memory"  - cookieless / in-memory only (zero cookies and zero localStorage
-  //               touched; classification still runs and fires events on the page).
+  //   "session" - ClickPatrol cookies only, max 24h (no 400d visitor cookie,
+  //               no localStorage). Advertising cookies keep their own lifetime.
+  //   "memory"  - cookieless / in-memory only. ClickPatrol writes no cookies and
+  //               no localStorage. Existing advertising cookies are still read
+  //               so a conversion keeps its click id. Classification events
+  //               still fire for the current page.
   var STORAGE_MODE = "full";
   // Optional: also trigger Adobe Launch Direct Call rules via
   // _satellite.track(eventName, payload) when a visit is classified.
@@ -133,14 +135,18 @@
   function lsAllowed() {
     return STORAGE_MODE === "full";
   }
-  function effectiveCookieTtl(maxAgeSeconds) {
-    if (STORAGE_MODE === "session" && maxAgeSeconds > SESSION_TTL_SECONDS) {
+  function isOwnStoreKey(name) {
+    return name === VISITOR_KEY || name === SESSION_KEY || name === CLASS_KEY || name === AUDIENCE_KEY;
+  }
+  // Session mode shortens only ClickPatrol's own cookies. Advertising cookies
+  // keep the lifetime of GCLID recovery and cookie extension.
+  function ownCookieTtl(name, maxAgeSeconds) {
+    if (STORAGE_MODE === "session" && isOwnStoreKey(name) && maxAgeSeconds > SESSION_TTL_SECONDS) {
       return SESSION_TTL_SECONDS;
     }
     return maxAgeSeconds;
   }
-  function getRawCookie(name) {
-    if (!cookiesAllowed()) { return null; }
+  function readRawCookie(name) {
     var prefix = name + "=";
     var parts = document.cookie ? document.cookie.split("; ") : [];
     for (var i = 0; i < parts.length; i++) {
@@ -150,13 +156,21 @@
     }
     return null;
   }
-  function getCookie(name) {
-    if (!cookiesAllowed()) {
-      return Object.prototype.hasOwnProperty.call(memStore, name) ? memStore[name] : null;
-    }
-    var raw = getRawCookie(encodeURIComponent(name));
+  function decodeCookieValue(raw) {
     if (raw === null) { return null; }
     try { return decodeURIComponent(raw); } catch (e) { return raw; }
+  }
+  function getRawCookie(name) {
+    if (!cookiesAllowed()) { return null; }
+    return readRawCookie(name);
+  }
+  function getCookie(name) {
+    // Memory mode keeps ClickPatrol ids in memory, but still reads advertising
+    // cookies so conversion click ids (gclid, gbraid, ...) are not dropped.
+    if (!cookiesAllowed() && isOwnStoreKey(name)) {
+      return Object.prototype.hasOwnProperty.call(memStore, name) ? memStore[name] : null;
+    }
+    return decodeCookieValue(readRawCookie(encodeURIComponent(name)));
   }
   function getAutoDomain() {
     if (!cookiesAllowed()) { return null; }
@@ -183,8 +197,7 @@
   function writeRawCookie(name, rawValue, maxAgeSeconds) {
     if (!cookiesAllowed()) { return; }
     var dom = getAutoDomain();
-    var ttl = effectiveCookieTtl(maxAgeSeconds);
-    var cookie = name + "=" + rawValue + "; path=/; max-age=" + ttl + "; SameSite=Lax";
+    var cookie = name + "=" + rawValue + "; path=/; max-age=" + maxAgeSeconds + "; SameSite=Lax";
     if (dom) {
       cookie += "; domain=" + dom;
     }
@@ -195,7 +208,7 @@
   }
   function setCookie(name, value, maxAgeSeconds) {
     memStore[name] = value;
-    writeRawCookie(encodeURIComponent(name), encodeURIComponent(value), maxAgeSeconds);
+    writeRawCookie(encodeURIComponent(name), encodeURIComponent(value), ownCookieTtl(name, maxAgeSeconds));
   }
   function lsGet(key) {
     if (!lsAllowed()) {
@@ -631,10 +644,12 @@
     if (hookedDataLayer) { return; }
     hookedDataLayer = true;
     window.dataLayer = window.dataLayer || [];
+    // Only conversions that were queued before this snippet. A classification
+    // already in the dataLayer is left alone; replay or trck-002 pushes it once.
     for (var i = 0; i < window.dataLayer.length; i++) {
       var queued = window.dataLayer[i];
-      if (queued && typeof queued === "object" && queued.event) {
-        try { handleItem(queued); } catch (e) {}
+      if (queued && typeof queued === "object" && queued.event === "ClickPatrol_Conversion") {
+        try { sendConversion(queued); } catch (e) {}
       }
     }
     var orig = window.dataLayer.push;
