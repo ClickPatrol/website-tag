@@ -323,11 +323,11 @@ const conv = (urls) => urls.filter((u) => u.indexOf('https://conversion.clckptrl
   check('window.clickPatrolClassification is populated',
     !!first.win.clickPatrolClassification && first.win.clickPatrolClassification.event === 'ClickPatrol_Legitimate' && first.win.clickPatrolClassification.audience.dhl_clean === true,
     JSON.stringify(first.win.clickPatrolClassification));
-  check('adobeDataLayer receives classification push',
-    adobeDl.length === 1 && adobeDl[0].event === 'ClickPatrol_Legitimate',
+  check('adobeDataLayer nests traffic and audience under clickPatrol',
+    adobeDl.length === 1 && adobeDl[0].event === 'ClickPatrol_Legitimate' && !adobeDl[0].traffic && adobeDl[0].clickPatrol.traffic === 'safe' && adobeDl[0].clickPatrol.audience.dhl_clean === true,
     JSON.stringify(adobeDl));
   check('_satellite.track fires when ADOBE_DIRECT_CALL is true',
-    satelliteCalls.length === 1 && satelliteCalls[0].name === 'ClickPatrol_Legitimate',
+    satelliteCalls.length === 1 && satelliteCalls[0].name === 'ClickPatrol_Legitimate' && satelliteCalls[0].payload.clickPatrol.traffic === 'safe',
     JSON.stringify(satelliteCalls));
 
   first.win.ClickPatrol.trackConversion({ conversion_id: 'dhl_order_1', conversion_type: 'purchase', conversion_value: 42, conversion_currency: 'EUR' });
@@ -395,6 +395,29 @@ const conv = (urls) => urls.filter((u) => u.indexOf('https://conversion.clckptrl
   check('a classification already in the dataLayer is replayed once',
     queuedEvents.length === 2 && queued.win.adobeDataLayer.length === 1,
     JSON.stringify({ events: queuedEvents.length, adobe: queued.win.adobeDataLayer.length }));
+
+  const wDrop = makeWorld();
+  wDrop.cookies._gcl_aw = 'GCL.1.keep';
+  const dropped = run(wDrop, { href: 'https://www.example.com/thanks' });
+  dropped.win.dataLayer.push({ event: 'ClickPatrol_Suspicious', traffic: 'fake' });
+  dropped.win.ClickPatrol.trackConversion({ conversion_id: 'order_w', conversion_type: 'lead' });
+  dropped.win.ClickPatrol.setStorageMode('memory');
+  check('setStorageMode memory deletes ClickPatrol cookies and localStorage',
+    !wDrop.cookies.cp_visitor_id && !wDrop.cookies.cp_session_id && !wDrop.cookies.cp_class && !wDrop.ls.cp_visitor_id && !wDrop.ls.cp_class && !wDrop.ls.cp_conv && wDrop.cookies._gcl_aw === 'GCL.1.keep',
+    JSON.stringify({ cookies: wDrop.cookies, ls: wDrop.ls }));
+  check('snippet exposes its version', dropped.win.ClickPatrol.version === '1.1.0' && dropped.win.ClickPatrol.snippetLoaded === true, dropped.win.ClickPatrol.version);
+
+  const wTwice = makeWorld();
+  const adobeTwice = [];
+  wTwice.win.adobeDataLayer = adobeTwice;
+  const once = run(wTwice, { href: 'https://www.example.com/?gclid=once' });
+  const visitorOnce = wTwice.cookies.cp_visitor_id;
+  const again = run(wTwice, { href: 'https://www.example.com/?gclid=once' });
+  once.win.dataLayer.push({ event: 'ClickPatrol_Legitimate', traffic: 'safe', audience: { dhl_clean: true } });
+  check('a second snippet does not load another tracker', trck(again.injected).length === 0, again.injected.join(' '));
+  check('a second snippet does not double the Adobe event',
+    adobeTwice.length === 1 && adobeTwice[0].clickPatrol.traffic === 'safe' && wTwice.cookies.cp_visitor_id === visitorOnce,
+    JSON.stringify(adobeTwice));
 }
 
 let failed = 0;

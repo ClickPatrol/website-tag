@@ -18,6 +18,8 @@
        ClickPatrol_Legitimate, ClickPatrol_Suspicious, ClickPatrol_Classification
        on window, window.clickPatrolClassification, window.adobeDataLayer, and
        optional _satellite.track), and first-party cookie cp_class.
+       The Adobe data layer push nests traffic and audience under clickPatrol.
+       dataLayer and the DOM events stay flat.
     4. Reloads trck-002 when a click id appears that differs from the last
        stored one (source, gclid, …). The same source or gclid replays.
     5. Loads the ClickPatrol measurement script (trck-002) only when needed:
@@ -45,6 +47,11 @@
 <script>
 (function () {
   "use strict";
+  var VERSION = "1.1.0";
+  var installed = window.ClickPatrol = window.ClickPatrol || {};
+  if (installed.snippetLoaded) { return; }
+  installed.snippetLoaded = true;
+  installed.version = VERSION;
   /* ====================== CONFIG ====================== */
   // REQUIRED: your ClickPatrol UID
   var UID = "ENTER-YOUR-UID-HERE";
@@ -56,7 +63,8 @@
   //   "memory"  - cookieless / in-memory only. ClickPatrol writes no cookies and
   //               no localStorage. Existing advertising cookies are still read
   //               so a conversion keeps its click id. Classification events
-  //               still fire for the current page.
+  //               still fire for the current page. setStorageMode("memory")
+  //               deletes cp_* cookies and localStorage keys.
   var STORAGE_MODE = "full";
   // Optional: also trigger Adobe Launch Direct Call rules via
   // _satellite.track(eventName, payload) when a visit is classified.
@@ -172,8 +180,7 @@
     }
     return decodeCookieValue(readRawCookie(encodeURIComponent(name)));
   }
-  function getAutoDomain() {
-    if (!cookiesAllowed()) { return null; }
+  function resolveAutoDomain() {
     if (autoDomainResolved) { return autoDomain; }
     autoDomainResolved = true;
     var host = location.hostname;
@@ -193,6 +200,10 @@
       }
     }
     return null;
+  }
+  function getAutoDomain() {
+    if (!cookiesAllowed()) { return null; }
+    return resolveAutoDomain();
   }
   function writeRawCookie(name, rawValue, maxAgeSeconds) {
     if (!cookiesAllowed()) { return; }
@@ -228,6 +239,30 @@
     delete memStore[key];
     if (!lsAllowed()) { return; }
     try { window.localStorage.removeItem(key); } catch (e) {}
+  }
+  function expireCookie(name) {
+    var encoded = encodeURIComponent(name);
+    var dom = resolveAutoDomain();
+    var base = encoded + "=; path=/; max-age=0; SameSite=Lax";
+    if (location.protocol === "https:") { base += "; Secure"; }
+    if (dom) { document.cookie = base + "; domain=" + dom; }
+    document.cookie = base;
+    delete memStore[name];
+  }
+  function lsRemoveForce(key) {
+    delete memStore[key];
+    try { window.localStorage.removeItem(key); } catch (e) {}
+  }
+  function clearOwnStorage() {
+    expireCookie(VISITOR_KEY);
+    expireCookie(SESSION_KEY);
+    expireCookie(CLASS_KEY);
+    expireCookie(AUDIENCE_KEY);
+    lsRemoveForce(VISITOR_KEY);
+    lsRemoveForce(SESSION_KEY);
+    lsRemoveForce(CLASS_KEY);
+    lsRemoveForce(AUDIENCE_KEY);
+    lsRemoveForce(CONV_KEY);
   }
   function generateId() {
     var hex = "0123456789abcdef";
@@ -613,19 +648,24 @@
     window.ClickPatrol.classification = payload;
     dispatchDomEvent(name, payload);
     dispatchDomEvent("ClickPatrol_Classification", payload);
+    var adobeEvent = {
+      event: name,
+      clickPatrol: { traffic: payload.traffic }
+    };
+    if (payload.audience) { adobeEvent.clickPatrol.audience = payload.audience; }
     if (
       window.adobeDataLayer &&
       typeof window.adobeDataLayer.push === "function" &&
       window.adobeDataLayer !== window.dataLayer
     ) {
-      try { window.adobeDataLayer.push(payload); } catch (e) {}
+      try { window.adobeDataLayer.push(adobeEvent); } catch (e) {}
     }
     if (
       ADOBE_DIRECT_CALL &&
       window._satellite &&
       typeof window._satellite.track === "function"
     ) {
-      try { window._satellite.track(name, payload); } catch (e) {}
+      try { window._satellite.track(name, adobeEvent); } catch (e) {}
     }
   }
   function handleItem(item) {
@@ -662,8 +702,12 @@
   }
   function setStorageMode(mode) {
     if (mode !== "full" && mode !== "session" && mode !== "memory") { return; }
+    if (mode === "memory") {
+      clearOwnStorage();
+      STORAGE_MODE = mode;
+      return;
+    }
     STORAGE_MODE = mode;
-    if (mode === "memory") { return; }
     if (activeVisitorId) {
       setCookie(VISITOR_KEY, activeVisitorId, VISITOR_TTL_SECONDS);
       lsSet(VISITOR_KEY, activeVisitorId);
