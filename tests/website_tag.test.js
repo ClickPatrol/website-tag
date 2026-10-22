@@ -59,11 +59,22 @@ function run(world, opts) {
     removeItem: (k) => { delete world.ls[k]; },
   };
   win.addEventListener = (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); };
+  win.dispatchEvent = (ev) => {
+    const list = listeners[ev.type] || [];
+    list.forEach((fn) => fn(ev));
+    return true;
+  };
+  win.CustomEvent = function (type, init) {
+    this.type = type;
+    this.detail = init && init.detail ? init.detail : null;
+  };
   win.setTimeout = (fn) => { timeouts.push(fn); return 1; };
   const history = { pushState: () => {} };
   win.history = history;
 
   let code = baseCode.replace('ENTER-YOUR-UID-HERE', 'TEST-UID-1234');
+  if (opts.storageMode) code = code.replace('var STORAGE_MODE = "full";', 'var STORAGE_MODE = "' + opts.storageMode + '";');
+  if (opts.adobeDirectCall) code = code.replace('var ADOBE_DIRECT_CALL = false;', 'var ADOBE_DIRECT_CALL = true;');
   if (opts.dedupe === false) code = code.replace('var DEDUPE_CONVERSIONS = true;', 'var DEDUPE_CONVERSIONS = false;');
   if (opts.gclidRecovery) code = code.replace('var GCLID_RECOVERY = false;', 'var GCLID_RECOVERY = true;');
   if (opts.extend) {
@@ -288,6 +299,66 @@ const conv = (urls) => urls.filter((u) => u.indexOf('https://conversion.clckptrl
   (held.listeners.load || []).forEach((fn) => fn());
   held.timeouts.splice(0).forEach((fn) => fn());
   check('trck-002 loads after window.load', trck(held.injected).length === 1, held.injected.join(' '));
+}
+
+// 10. Adobe Launch exposure: DOM CustomEvents, window.clickPatrolClassification, adobeDataLayer, _satellite.track, and trackConversion.
+{
+  const w = makeWorld();
+  w.cookies.cp_session_id = 'cp_adobe_session';
+  const adobeDl = [];
+  const satelliteCalls = [];
+  w.win.adobeDataLayer = adobeDl;
+  w.win._satellite = { track: (name, payload) => satelliteCalls.push({ name, payload }) };
+
+  const firedEvents = [];
+  const first = run(w, { adobeDirectCall: true, href: 'https://www.example.com/?gclid=adobetest' });
+  first.win.addEventListener('ClickPatrol_Legitimate', (e) => firedEvents.push({ type: e.type, detail: e.detail }));
+  first.win.addEventListener('ClickPatrol_Classification', (e) => firedEvents.push({ type: e.type, detail: e.detail }));
+
+  first.win.dataLayer.push({ event: 'ClickPatrol_Legitimate', traffic: 'safe', audience: { dhl_clean: true } });
+
+  check('DOM CustomEvent fires for ClickPatrol_Legitimate and ClickPatrol_Classification',
+    firedEvents.length === 2 && firedEvents[0].type === 'ClickPatrol_Legitimate' && firedEvents[1].type === 'ClickPatrol_Classification' && firedEvents[0].detail.traffic === 'safe',
+    JSON.stringify(firedEvents));
+  check('window.clickPatrolClassification is populated',
+    !!first.win.clickPatrolClassification && first.win.clickPatrolClassification.event === 'ClickPatrol_Legitimate' && first.win.clickPatrolClassification.audience.dhl_clean === true,
+    JSON.stringify(first.win.clickPatrolClassification));
+  check('adobeDataLayer receives classification push',
+    adobeDl.length === 1 && adobeDl[0].event === 'ClickPatrol_Legitimate',
+    JSON.stringify(adobeDl));
+  check('_satellite.track fires when ADOBE_DIRECT_CALL is true',
+    satelliteCalls.length === 1 && satelliteCalls[0].name === 'ClickPatrol_Legitimate',
+    JSON.stringify(satelliteCalls));
+
+  first.win.ClickPatrol.trackConversion({ conversion_id: 'dhl_order_1', conversion_type: 'purchase', conversion_value: 42, conversion_currency: 'EUR' });
+  const c = conv(first.injected);
+  check('window.ClickPatrol.trackConversion sends conversion',
+    c.length === 1 && c[0].includes('conversion_id=dhl_order_1') && c[0].includes('conversion_type=TRANSACTION'),
+    JSON.stringify(c));
+}
+
+// 11. Consent / storage modes ("session" and "memory", plus dynamic upgrade via setStorageMode).
+{
+  const wMem = makeWorld();
+  const memRun = run(wMem, { storageMode: 'memory', href: 'https://www.example.com/?source=g&gclid=mem123' });
+  memRun.win.dataLayer.push({ event: 'ClickPatrol_Suspicious', traffic: 'fake' });
+  check('memory mode writes zero cookies and zero localStorage',
+    Object.keys(wMem.cookies).length === 0 && Object.keys(wMem.ls).length === 0,
+    JSON.stringify({ cookies: wMem.cookies, ls: wMem.ls }));
+  check('memory mode still exposes classification in memory',
+    !!memRun.win.clickPatrolClassification && memRun.win.clickPatrolClassification.event === 'ClickPatrol_Suspicious',
+    JSON.stringify(memRun.win.clickPatrolClassification));
+
+  memRun.win.ClickPatrol.setStorageMode('full');
+  check('setStorageMode("full") persists active IDs and classification after consent',
+    !!wMem.cookies.cp_visitor_id && !!wMem.cookies.cp_session_id && !!wMem.cookies.cp_class && !!wMem.ls.cp_class,
+    JSON.stringify({ cookies: wMem.cookies, ls: wMem.ls }));
+
+  const wSess = makeWorld();
+  run(wSess, { storageMode: 'session', href: 'https://www.example.com/?source=g' });
+  check('session mode caps cp_visitor_id cookie TTL to 24h and skips localStorage',
+    /max-age=86400/.test((wSess.cookieAttrs || {}).cp_visitor_id || '') && Object.keys(wSess.ls).length === 0,
+    JSON.stringify({ attrs: wSess.cookieAttrs, ls: wSess.ls }));
 }
 
 let failed = 0;

@@ -8,19 +8,26 @@
   Use one install path per site: this snippet OR the GTM template OR a CMS plugin.
   What it does:
     1. Keeps a first-party visitor id (400 days) and session id (1 day, rolling)
-       in a cookie + localStorage.
+       in a cookie + localStorage (configurable via STORAGE_MODE: "full",
+       "session", or "memory" for strict consent scenarios).
     2. After the first classification, reuses ClickPatrol_Legitimate /
        ClickPatrol_Suspicious (and audience flags) on later pages without
        calling the measurement script again.
-    3. Reloads trck-002 when a click id appears that differs from the last
+    3. Exposes every classification to Google Tag Manager (window.dataLayer),
+       Adobe Launch / Adobe Experience Platform Tags (DOM CustomEvents
+       ClickPatrol_Legitimate, ClickPatrol_Suspicious, ClickPatrol_Classification
+       on window, window.clickPatrolClassification, window.adobeDataLayer, and
+       optional _satellite.track), and first-party cookie cp_class.
+    4. Reloads trck-002 when a click id appears that differs from the last
        stored one (source, gclid, …). The same source or gclid replays.
-    4. Loads the ClickPatrol measurement script (trck-002) only when needed:
+    5. Loads the ClickPatrol measurement script (trck-002) only when needed:
        https://trck-002.clckptrl.com/?uid=...&<page query>&u=<href>&visitor_id=...&session_id=...
-    5. Sends a conversion to ClickPatrol on every ClickPatrol_Conversion push.
+    6. Sends a conversion to ClickPatrol on every ClickPatrol_Conversion push,
+       DOM CustomEvent, or window.ClickPatrol.trackConversion(...) call.
        Click ids come from the push, the page URL, or first-party ad cookies
        (gclid from _gcl_aw, gbraid from _gcl_ag, wbraid from _gcl_gb, …).
        A repeated conversion_id in the same session is ignored.
-    6. Optional, all off by default: GCLID recovery for Safari/ITP and
+    7. Optional, all off by default: GCLID recovery for Safari/ITP and
        lifetime extension of first-party advertising cookies.
 
   Conversion (push after a confirmed lead or purchase, on any page):
@@ -41,6 +48,17 @@
   /* ====================== CONFIG ====================== */
   // REQUIRED: your ClickPatrol UID
   var UID = "ENTER-YOUR-UID-HERE";
+  // Storage mode for first-party ClickPatrol identifiers and cache:
+  //   "full"    - default: cp_visitor_id (400d), cp_session_id (24h), cp_class (24h),
+  //               cp_audience (24h) in first-party cookies + localStorage backup.
+  //   "session" - session-scoped cookies only (max 24h, no 400d persistent visitor
+  //               cookie, no localStorage writes).
+  //   "memory"  - cookieless / in-memory only (zero cookies and zero localStorage
+  //               touched; classification still runs and fires events on the page).
+  var STORAGE_MODE = "full";
+  // Optional: also trigger Adobe Launch Direct Call rules via
+  // _satellite.track(eventName, payload) when a visit is classified.
+  var ADOBE_DIRECT_CALL = false;
   // Ignore a repeated ClickPatrol_Conversion with the same conversion_id in
   // this session (stops a thank-you page refresh from counting twice).
   var DEDUPE_CONVERSIONS = true;
@@ -103,9 +121,26 @@
     { on: "googleDV360", list: [["_gcl_dc", L90]] }
   ];
   var hookedDataLayer = false;
+  var activeVisitorId = "";
   var activeSessionId = "";
   var replaying = false;
+  var autoDomain = null;
+  var autoDomainResolved = false;
+  var memStore = {};
+  function cookiesAllowed() {
+    return STORAGE_MODE !== "memory";
+  }
+  function lsAllowed() {
+    return STORAGE_MODE === "full";
+  }
+  function effectiveCookieTtl(maxAgeSeconds) {
+    if (STORAGE_MODE === "session" && maxAgeSeconds > SESSION_TTL_SECONDS) {
+      return SESSION_TTL_SECONDS;
+    }
+    return maxAgeSeconds;
+  }
   function getRawCookie(name) {
+    if (!cookiesAllowed()) { return null; }
     var prefix = name + "=";
     var parts = document.cookie ? document.cookie.split("; ") : [];
     for (var i = 0; i < parts.length; i++) {
@@ -116,11 +151,17 @@
     return null;
   }
   function getCookie(name) {
+    if (!cookiesAllowed()) {
+      return Object.prototype.hasOwnProperty.call(memStore, name) ? memStore[name] : null;
+    }
     var raw = getRawCookie(encodeURIComponent(name));
     if (raw === null) { return null; }
     try { return decodeURIComponent(raw); } catch (e) { return raw; }
   }
   function getAutoDomain() {
+    if (!cookiesAllowed()) { return null; }
+    if (autoDomainResolved) { return autoDomain; }
+    autoDomainResolved = true;
     var host = location.hostname;
     if (!host || host === "localhost" || /^[0-9.]+$/.test(host)) {
       return null;
@@ -133,16 +174,19 @@
       if (document.cookie.indexOf(testName + "=") !== -1) {
         document.cookie = testName + "=; domain=" + candidate +
           "; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax";
+        autoDomain = candidate;
         return candidate;
       }
     }
     return null;
   }
-  var autoDomain = getAutoDomain();
   function writeRawCookie(name, rawValue, maxAgeSeconds) {
-    var cookie = name + "=" + rawValue + "; path=/; max-age=" + maxAgeSeconds + "; SameSite=Lax";
-    if (autoDomain) {
-      cookie += "; domain=" + autoDomain;
+    if (!cookiesAllowed()) { return; }
+    var dom = getAutoDomain();
+    var ttl = effectiveCookieTtl(maxAgeSeconds);
+    var cookie = name + "=" + rawValue + "; path=/; max-age=" + ttl + "; SameSite=Lax";
+    if (dom) {
+      cookie += "; domain=" + dom;
     }
     if (location.protocol === "https:") {
       cookie += "; Secure";
@@ -150,18 +194,26 @@
     document.cookie = cookie;
   }
   function setCookie(name, value, maxAgeSeconds) {
+    memStore[name] = value;
     writeRawCookie(encodeURIComponent(name), encodeURIComponent(value), maxAgeSeconds);
   }
   function lsGet(key) {
+    if (!lsAllowed()) {
+      return Object.prototype.hasOwnProperty.call(memStore, key) ? memStore[key] : null;
+    }
     try { return window.localStorage.getItem(key); } catch (e) { return null; }
   }
   function lsSet(key, value) {
+    memStore[key] = value;
+    if (!lsAllowed()) { return; }
     try {
       if (window.localStorage.getItem(key) === value) { return; }
       window.localStorage.setItem(key, value);
     } catch (e) {}
   }
   function lsRemove(key) {
+    delete memStore[key];
+    if (!lsAllowed()) { return; }
     try { window.localStorage.removeItem(key); } catch (e) {}
   }
   function generateId() {
@@ -517,13 +569,62 @@
     url = appendQuery(url, "tblci", clickFromItemUrlOrCookie(item, "tblci", "", null));
     injectScript(url, "");
   }
+  function dispatchDomEvent(eventName, detail) {
+    if (!window.dispatchEvent) { return; }
+    try {
+      var ev;
+      if (typeof window.CustomEvent === "function") {
+        ev = new window.CustomEvent(eventName, { detail: detail, bubbles: true });
+      } else if (document.createEvent) {
+        ev = document.createEvent("CustomEvent");
+        ev.initCustomEvent(eventName, true, false, detail);
+      }
+      if (ev) { window.dispatchEvent(ev); }
+    } catch (e) {}
+  }
+  function emitClassification(item) {
+    if (!item || typeof item !== "object" || !item.event) { return; }
+    var name = String(item.event);
+    if (name !== "ClickPatrol_Legitimate" && name !== "ClickPatrol_Suspicious") {
+      return;
+    }
+    var payload = {
+      event: name,
+      traffic: asString(item.traffic)
+    };
+    if (item.audience && typeof item.audience === "object") {
+      payload.audience = item.audience;
+    }
+    window.clickPatrolClassification = payload;
+    window.ClickPatrol = window.ClickPatrol || {};
+    window.ClickPatrol.classification = payload;
+    dispatchDomEvent(name, payload);
+    dispatchDomEvent("ClickPatrol_Classification", payload);
+    if (
+      window.adobeDataLayer &&
+      typeof window.adobeDataLayer.push === "function" &&
+      window.adobeDataLayer !== window.dataLayer
+    ) {
+      try { window.adobeDataLayer.push(payload); } catch (e) {}
+    }
+    if (
+      ADOBE_DIRECT_CALL &&
+      window._satellite &&
+      typeof window._satellite.track === "function"
+    ) {
+      try { window._satellite.track(name, payload); } catch (e) {}
+    }
+  }
   function handleItem(item) {
     if (!item || typeof item !== "object" || !item.event) { return; }
     var name = String(item.event);
     if (name === "ClickPatrol_Conversion") {
       sendConversion(item);
-    } else if (name.indexOf("ClickPatrol_") === 0 && !replaying) {
-      storeFromEvent(item, activeSessionId);
+    } else if (name.indexOf("ClickPatrol_") === 0) {
+      if (!replaying) {
+        storeFromEvent(item, activeSessionId);
+      }
+      emitClassification(item);
     }
   }
   function hookDataLayer() {
@@ -532,8 +633,8 @@
     window.dataLayer = window.dataLayer || [];
     for (var i = 0; i < window.dataLayer.length; i++) {
       var queued = window.dataLayer[i];
-      if (queued && typeof queued === "object" && queued.event === "ClickPatrol_Conversion") {
-        try { sendConversion(queued); } catch (e) {}
+      if (queued && typeof queued === "object" && queued.event) {
+        try { handleItem(queued); } catch (e) {}
       }
     }
     var orig = window.dataLayer.push;
@@ -544,14 +645,31 @@
       return orig.apply(window.dataLayer, arguments);
     };
   }
+  function setStorageMode(mode) {
+    if (mode !== "full" && mode !== "session" && mode !== "memory") { return; }
+    STORAGE_MODE = mode;
+    if (mode === "memory") { return; }
+    if (activeVisitorId) {
+      setCookie(VISITOR_KEY, activeVisitorId, VISITOR_TTL_SECONDS);
+      lsSet(VISITOR_KEY, activeVisitorId);
+    }
+    if (activeSessionId) {
+      setCookie(SESSION_KEY, activeSessionId, SESSION_TTL_SECONDS);
+      lsSet(SESSION_KEY, activeSessionId);
+    }
+    if (window.clickPatrolClassification && activeSessionId) {
+      storeFromEvent(window.clickPatrolClassification, activeSessionId);
+    }
+  }
   function recoverGclid() {
-    if (!GCLID_RECOVERY) { return; }
+    if (!GCLID_RECOVERY || !cookiesAllowed()) { return; }
     var vdGclid = getQueryParam("vd");
     if (!getQueryParam("gclid") && vdGclid && !getCookie("_gcl_aw")) {
       setCookie("_gcl_aw", "GCL." + Math.floor(Date.now() / 1000) + "." + vdGclid, L90);
     }
   }
   function extendCookies() {
+    if (!cookiesAllowed()) { return; }
     for (var g = 0; g < EXTEND_GROUPS.length; g++) {
       if (EXTEND_COOKIES[EXTEND_GROUPS[g].on] !== true) { continue; }
       var list = EXTEND_GROUPS[g].list;
@@ -565,6 +683,7 @@
   function injectTracker() {
     var visitorId = readOrCreateId(VISITOR_KEY, VISITOR_TTL_SECONDS);
     var sessionId = readOrCreateId(SESSION_KEY, SESSION_TTL_SECONDS);
+    activeVisitorId = visitorId;
     activeSessionId = sessionId;
     recoverGclid();
     extendCookies();
@@ -582,6 +701,14 @@
     scriptUrl += "&session_id=" + encodeURIComponent(sessionId);
     injectTrackerWhenLoaded(scriptUrl);
   }
+  window.ClickPatrol = window.ClickPatrol || {};
+  window.ClickPatrol.trackConversion = sendConversion;
+  window.ClickPatrol.setStorageMode = setStorageMode;
+  window.addEventListener("ClickPatrol_Conversion", function (event) {
+    if (event && event.detail && typeof event.detail === "object") {
+      sendConversion(event.detail);
+    }
+  });
   var trackerPending = "";
   var trackerLoadWait = false;
   // Same rule as cp-core.js. A script inserted before window.load holds the
